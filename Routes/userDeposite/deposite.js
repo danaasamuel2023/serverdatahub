@@ -267,14 +267,14 @@ router.post('/initialize-payment',
         amount: amountInKobo,
         currency: settings.general.currency || 'GHS',
         reference,
-        callback_url: callback_url || `${process.env.FRONTEND_URL}/deposit/verify`,
+        callback_url: callback_url || `https://console.datahubgh.com/deposit/verify`,
         metadata: {
           userId: userId,
           userEmail: user.email,
           phoneNumber: user.phoneNumber,
           desiredAmount: desiredAmount,
           processingFee: fee
-        }
+        } 
       });
 
       return res.json({
