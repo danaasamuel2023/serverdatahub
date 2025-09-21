@@ -1134,6 +1134,411 @@ router.get('/wallet-history',
   })
 );
 
+// Add this to your order.routes.js file after the regular /place endpoint
+
+// ============================================
+// BULK ORDER PLACEMENT - Multiple orders at once
+// ============================================
+router.post('/place-bulk',
+  rateLimit({ max: 10, windowMs: 60000 }), // 10 bulk requests per minute
+  asyncHandler(async (req, res) => {
+    const { orders, networkKey, capacity } = req.body;
+    const userId = req.userId;
+    const settings = req.systemSettings;
+    const session = await mongoose.startSession();
+
+    try {
+      // Validate input
+      if (!orders || !Array.isArray(orders) || orders.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: 'Please provide an array of orders',
+          example: {
+            orders: [
+              { recipient: '0241234567', capacity: 5 },
+              { recipient: '0551234567', capacity: 10 }
+            ],
+            networkKey: 'MTN' // Optional, can be specified per order
+          }
+        });
+      }
+
+      // Limit bulk orders to prevent abuse
+      if (orders.length > 50) {
+        return res.status(400).json({
+          success: false,
+          message: 'Maximum 50 orders allowed per bulk request'
+        });
+      }
+
+      // Validate phone numbers
+      const phoneRegex = /^(?:\+233|233|0)(20|23|24|25|26|27|28|29|30|31|32|50|53|54|55|56|57|58|59)\d{7}$/;
+      const invalidPhones = orders.filter(o => !phoneRegex.test(o.recipient));
+      
+      if (invalidPhones.length > 0) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid phone numbers detected',
+          invalidRecipients: invalidPhones.map(o => o.recipient)
+        });
+      }
+
+      const result = await session.withTransaction(async () => {
+        // Get user
+        const user = await BorisUser.findById(userId).session(session);
+        if (!user) {
+          throw new Error('User not found');
+        }
+
+        if (user.isDisabled) {
+          throw new Error(`Account is disabled: ${user.disableReason || 'Contact support'}`);
+        }
+
+        // Process each order
+        const results = {
+          successful: [],
+          failed: [],
+          totalCost: 0,
+          totalOrders: orders.length
+        };
+
+        // Calculate total cost first to check balance
+        let totalCost = 0;
+        const orderDetails = [];
+
+        for (const orderItem of orders) {
+          const orderNetworkKey = orderItem.networkKey || networkKey;
+          const orderCapacity = orderItem.capacity || capacity;
+
+          if (!orderNetworkKey || !orderCapacity) {
+            results.failed.push({
+              recipient: orderItem.recipient,
+              error: 'Missing network or capacity'
+            });
+            continue;
+          }
+
+          // Get network configuration
+          const network = await NetworkConfig.findOne({ 
+            networkKey: orderNetworkKey, 
+            isActive: true 
+          }).session(session);
+          
+          if (!network) {
+            results.failed.push({
+              recipient: orderItem.recipient,
+              error: `Network ${orderNetworkKey} not available`
+            });
+            continue;
+          }
+
+          // Find bundle
+          const bundle = network.bundles.find(b => 
+            b.capacity === orderCapacity && b.isActive
+          );
+          
+          if (!bundle) {
+            results.failed.push({
+              recipient: orderItem.recipient,
+              error: `${orderCapacity}GB bundle not available for ${orderNetworkKey}`
+            });
+            continue;
+          }
+
+          totalCost += bundle.price;
+          orderDetails.push({
+            ...orderItem,
+            network,
+            bundle,
+            price: bundle.price,
+            resellerPrice: bundle.resellerPrice,
+            profit: bundle.price - bundle.resellerPrice
+          });
+        }
+
+        // Check if user has sufficient balance
+        if (user.wallet.balance < totalCost) {
+          throw new Error(`Insufficient balance. Need GHS ${totalCost.toFixed(2)}, have GHS ${user.wallet.balance.toFixed(2)}`);
+        }
+
+        // Track balance for the entire bulk operation
+        const initialBalance = user.wallet.balance;
+        let currentBalance = initialBalance;
+
+        // Process each valid order
+        for (const orderDetail of orderDetails) {
+          try {
+            const balanceBefore = currentBalance;
+            const balanceAfter = balanceBefore - orderDetail.price;
+            const reference = generateOrderReference();
+
+            // Get provider settings
+            const primaryProvider = orderDetail.network.provider?.primary || 'MANUAL';
+            const fallbackProvider = orderDetail.network.provider?.fallback || null;
+
+            // Try to process with provider
+            let apiResponse = null;
+            let orderId = null;
+            let status = 'pending';
+            let usedProvider = null;
+
+            // Try primary provider
+            const primaryResult = await processOrderWithProvider(
+              primaryProvider,
+              orderDetail.networkKey || networkKey,
+              orderDetail.recipient,
+              orderDetail.capacity || capacity,
+              reference,
+              settings
+            );
+
+            if (primaryResult.success) {
+              apiResponse = primaryResult.data;
+              usedProvider = primaryResult.provider;
+              
+              if (primaryResult.isManual) {
+                status = 'onPending';
+              } else {
+                status = primaryResult.status || 'processing';
+                orderId = primaryResult.orderId || primaryResult.vendorTranxId;
+              }
+            } else if (fallbackProvider) {
+              // Try fallback provider
+              const fallbackResult = await processOrderWithProvider(
+                fallbackProvider,
+                orderDetail.networkKey || networkKey,
+                orderDetail.recipient,
+                orderDetail.capacity || capacity,
+                reference,
+                settings
+              );
+              
+              if (fallbackResult.success) {
+                apiResponse = fallbackResult.data;
+                usedProvider = fallbackResult.provider;
+                
+                if (fallbackResult.isManual) {
+                  status = 'onPending';
+                } else {
+                  status = fallbackResult.status || 'processing';
+                  orderId = fallbackResult.orderId || fallbackResult.vendorTranxId;
+                }
+              } else {
+                status = 'onPending';
+                usedProvider = 'MANUAL';
+              }
+            } else {
+              status = 'onPending';
+              usedProvider = 'MANUAL';
+            }
+
+            // Create order
+            const order = new OrderBoris({
+              user: userId,
+              reference,
+              transactionReference: new mongoose.Types.ObjectId().toString(),
+              networkKey: orderDetail.networkKey || networkKey,
+              recipient: orderDetail.recipient,
+              capacity: orderDetail.capacity || capacity,
+              price: orderDetail.price,
+              resellerPrice: orderDetail.resellerPrice,
+              profit: orderDetail.profit,
+              status,
+              apiResponse,
+              apiOrderId: orderId,
+              balanceBefore,
+              balanceAfter,
+              provider: usedProvider,
+              isBulkOrder: true,
+              bulkOrderGroup: req.body.bulkOrderId || new mongoose.Types.ObjectId().toString()
+            });
+
+            await order.save({ session });
+            currentBalance = balanceAfter;
+
+            results.successful.push({
+              recipient: orderDetail.recipient,
+              reference: order.reference,
+              orderId: order._id,
+              status: order.status,
+              price: order.price,
+              provider: usedProvider
+            });
+
+          } catch (error) {
+            console.error(`Failed to process order for ${orderDetail.recipient}:`, error);
+            results.failed.push({
+              recipient: orderDetail.recipient,
+              error: error.message
+            });
+          }
+        }
+
+        // Update user wallet if any orders were successful
+        if (results.successful.length > 0) {
+          const totalSpent = results.successful.reduce((sum, o) => sum + o.price, 0);
+          
+          // Add single bulk transaction to wallet
+          user.wallet.transactions.push({
+            type: 'debit',
+            amount: totalSpent,
+            description: `Bulk order: ${results.successful.length} successful orders`,
+            reference: `BULK-${Date.now()}`,
+            timestamp: new Date(),
+            status: 'completed',
+            balanceBefore: initialBalance,
+            balanceAfter: currentBalance
+          });
+          
+          user.wallet.balance = currentBalance;
+          user.markModified('wallet');
+          await user.save({ session });
+
+          results.totalCost = totalSpent;
+          results.newBalance = currentBalance;
+        }
+
+        return results;
+      });
+
+      // Prepare response
+      const response = {
+        success: result.successful.length > 0,
+        message: `Bulk order processed: ${result.successful.length} successful, ${result.failed.length} failed`,
+        data: {
+          summary: {
+            totalOrders: result.totalOrders,
+            successful: result.successful.length,
+            failed: result.failed.length,
+            totalCost: result.totalCost,
+            newBalance: result.newBalance
+          },
+          successfulOrders: result.successful,
+          failedOrders: result.failed
+        }
+      };
+
+      if (result.successful.length === 0) {
+        return res.status(400).json(response);
+      }
+
+      res.status(201).json(response);
+
+    } catch (error) {
+      console.error('Bulk order error:', error);
+
+      if (error.message.includes('Insufficient balance')) {
+        return res.status(400).json({
+          success: false,
+          message: error.message
+        });
+      }
+
+      res.status(500).json({
+        success: false,
+        message: error.message || 'Failed to process bulk order'
+      });
+    } finally {
+      await session.endSession();
+    }
+  })
+);
+
+// ============================================
+// BULK ORDER FROM CSV/FILE
+// ============================================
+router.post('/place-bulk-csv',
+  rateLimit({ max: 5, windowMs: 60000 }), // 5 CSV uploads per minute
+  asyncHandler(async (req, res) => {
+    const { csvData, networkKey, defaultCapacity } = req.body;
+    const userId = req.userId;
+
+    try {
+      // Parse CSV data
+      // Expected format: "recipient,capacity" or just "recipient" (uses defaultCapacity)
+      const lines = csvData.split('\n').filter(line => line.trim());
+      const orders = [];
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+
+        // Skip header if present
+        if (i === 0 && line.toLowerCase().includes('recipient')) continue;
+
+        const parts = line.split(',').map(p => p.trim());
+        const recipient = parts[0];
+        const capacity = parts[1] ? parseFloat(parts[1]) : defaultCapacity;
+
+        if (recipient) {
+          orders.push({ recipient, capacity });
+        }
+      }
+
+      if (orders.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: 'No valid orders found in CSV data'
+        });
+      }
+
+      // Process using the bulk endpoint logic
+      req.body = { orders, networkKey };
+      
+      // Call the bulk placement endpoint
+      return router.handle(req, res);
+      
+    } catch (error) {
+      console.error('CSV bulk order error:', error);
+      res.status(400).json({
+        success: false,
+        message: 'Failed to process CSV data',
+        error: error.message
+      });
+    }
+  })
+);
+
+// ============================================
+// GET BULK ORDER STATUS
+// ============================================
+router.get('/bulk-status/:bulkOrderGroup',
+  asyncHandler(async (req, res) => {
+    const { bulkOrderGroup } = req.params;
+    const userId = req.userId;
+
+    const orders = await OrderBoris.find({
+      user: userId,
+      bulkOrderGroup
+    }).select('reference recipient capacity price status provider createdAt');
+
+    if (orders.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Bulk order group not found'
+      });
+    }
+
+    const summary = {
+      total: orders.length,
+      completed: orders.filter(o => o.status === 'completed').length,
+      pending: orders.filter(o => o.status === 'onPending').length,
+      processing: orders.filter(o => o.status === 'processing').length,
+      failed: orders.filter(o => o.status === 'failed').length,
+      totalCost: orders.reduce((sum, o) => sum + o.price, 0)
+    };
+
+    res.json({
+      success: true,
+      data: {
+        bulkOrderGroup,
+        summary,
+        orders
+      }
+    });
+  })
+);
+
 // Apply error handler
 router.use(errorHandler);
 
