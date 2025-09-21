@@ -384,7 +384,7 @@ router.post('/place',
           if (primaryResult.isManual) {
             status = 'onPending';
           } else {
-            status = primaryResult.status || 'processing';
+            status = primaryResult.status || 'completed';
             orderId = primaryResult.orderId || primaryResult.vendorTranxId;
           }
         } else if (fallbackProvider) {
